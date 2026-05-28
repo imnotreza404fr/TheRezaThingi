@@ -578,12 +578,21 @@ generate_config() {
     "levels": { "0": { "statsUserUplink": true, "statsUserDownlink": true, "handshake": 3, "connIdle": 600, "uplinkOnly": 1, "downlinkOnly": 2, "bufferSize": 512 } }
   },
   "dns": {
-    "hosts": { "dns.google": "8.8.8.8", "dns.cloudflare": "1.1.1.1" },
+    "hosts": {
+      "dns.google": ["8.8.8.8", "8.8.4.4"],
+      "cloudflare-dns.com": ["1.1.1.1", "1.0.0.1"]
+    },
     "servers": [
-      { "address": "https://1.1.1.1/dns-query", "domains": ["geosite:geolocation-!cn"], "queryStrategy": "UseIPv4" },
-      "8.8.4.4", "localhost"
+      { "address": "https+local://1.1.1.1/dns-query", "queryStrategy": "UseIPv4", "timeoutMs": 2500 },
+      { "address": "https+local://dns.google/dns-query", "queryStrategy": "UseIPv4", "timeoutMs": 2500 },
+      { "address": "1.0.0.1", "queryStrategy": "UseIPv4", "timeoutMs": 2000 },
+      { "address": "8.8.4.4", "queryStrategy": "UseIPv4", "timeoutMs": 2000 },
+      "localhost"
     ],
-    "queryStrategy": "UseIPv4"
+    "queryStrategy": "UseIPv4",
+    "disableFallback": false,
+    "disableFallbackIfMatch": false,
+    "enableParallelQuery": true
   },
   "inbounds": [
     {

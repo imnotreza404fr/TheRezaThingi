@@ -125,6 +125,29 @@ test_xray_version_can_be_pinned() {
     pass 'Dockerfile supports pinned Xray version'
 }
 
+test_generated_config_uses_resilient_dns_fallback() {
+    grep_fixed '"enableParallelQuery": true' "$SCRIPT" \
+        || fail 'generated Xray DNS config does not race equivalent fallback resolvers'
+    grep_fixed '"disableFallback": false' "$SCRIPT" \
+        || fail 'generated Xray DNS config does not explicitly keep fallback enabled'
+    grep_fixed '"disableFallbackIfMatch": false' "$SCRIPT" \
+        || fail 'generated Xray DNS config could stop fallback after a matched resolver times out'
+    grep_fixed '"https+local://1.1.1.1/dns-query"' "$SCRIPT" \
+        || fail 'generated Xray DNS config does not use local-mode Cloudflare DoH'
+    grep_fixed '"https+local://dns.google/dns-query"' "$SCRIPT" \
+        || fail 'generated Xray DNS config does not include Google DoH fallback'
+    grep_fixed '"address": "1.0.0.1"' "$SCRIPT" \
+        || fail 'generated Xray DNS config does not include Cloudflare UDP fallback'
+    grep_fixed '"address": "8.8.4.4"' "$SCRIPT" \
+        || fail 'generated Xray DNS config does not include Google UDP fallback'
+    grep_fixed '"timeoutMs": 2500' "$SCRIPT" \
+        || fail 'generated Xray DNS config does not bound DoH resolver wait time'
+    if grep_fixed '"domains": ["geosite:geolocation-!cn"]' "$SCRIPT"; then
+        fail 'generated Xray DNS config still pins most lookups to a single domain-matched resolver before fallback'
+    fi
+    pass 'generated Xray config uses resilient DNS fallback'
+}
+
 test_generated_links_include_domain_and_ip_variants() {
     grep_fixed 'resolve_domain_ip()' "$SCRIPT" \
         || fail 'script does not provide a resolver for the Codespaces app domain'
@@ -284,6 +307,7 @@ test_self_update_is_opt_in
 test_exit_trap_preserves_failures
 test_generated_files_are_ignored
 test_xray_version_can_be_pinned
+test_generated_config_uses_resilient_dns_fallback
 test_generated_links_include_domain_and_ip_variants
 test_terminal_branding_is_customized_red
 test_runtime_diagnostics_logging
