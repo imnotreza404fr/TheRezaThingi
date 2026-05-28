@@ -132,7 +132,7 @@ resolve_domain_ips() {
     } | awk '/^[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*$/ && !seen[$0]++ {print}')
     if [[ -n "$candidates" ]]; then
         joined=$(printf '%s' "$candidates" | tr '\n' ',' | sed 's/,$//')
-        log_event INFO "resolver domain=${domain} ips=${joined}"
+        log_event INFO "resolver domain=${domain} fallback_candidates=${joined}"
     else
         log_event WARN "resolver domain=${domain} no-ip-candidates"
     fi
@@ -718,10 +718,9 @@ generate_ordered_links() {
     fi
 }
 
-refresh_config_exports() {
-    [[ -f "$UUID_FILE" ]] || return 0
+write_config_exports_from_links() {
     local links encoded count hash
-    links=$(generate_ordered_links | awk 'NF' || true)
+    links=$(printf '%s\n' "$@" | awk 'NF')
     [[ -n "$links" ]] || return 1
     _atomic_write "$MOBILE_CONFIG_FILE" "$links"
     if command -v base64 >/dev/null 2>&1; then
@@ -731,6 +730,14 @@ refresh_config_exports() {
     count=$(printf '%s\n' "$links" | awk 'NF {c++} END {print c+0}')
     hash=$(fingerprint_secret "$links")
     log_event INFO "config_exports refreshed count=${count} hash=${hash}"
+}
+
+refresh_config_exports() {
+    [[ -f "$UUID_FILE" ]] || return 0
+    local link_array=()
+    mapfile -t link_array < <(generate_ordered_links | awk 'NF' || true)
+    ((${#link_array[@]})) || return 1
+    write_config_exports_from_links "${link_array[@]}"
 }
 
 generate_link() {
@@ -793,7 +800,8 @@ show_diagnostics() {
         echo -e "  ${DIM}gh CLI unavailable.${NC}"
     fi
 
-    echo -e "\n  ${WHITE}${B}Resolved Fallback IPs${NC}"
+    echo -e "\n  ${WHITE}${B}Fallback IP Candidates${NC}"
+    echo -e "  ${DIM}(includes resolved, manual, and built-in fallbacks)${NC}"
     local ips; ips=$(resolve_domain_ips "$PORT_DOMAIN" || true)
     if [[ -n "$ips" ]]; then
         printf '%s\n' "$ips" | sed 's/^/  /'
@@ -818,7 +826,7 @@ show_diagnostics() {
 }
 
 force_reconnect() {
-    local no_prompt="${1:-}"
+    local no_prompt="${1:-}" failed=0
     log_event INFO "force_reconnect begin no_prompt=${no_prompt:-false}"
     echo -e "\n  ${GREEN}⠋${NC} ${WHITE}Running Clean Hard Restart & Reconnect Sequence...${NC}\n"
 
@@ -831,15 +839,21 @@ force_reconnect() {
         || echo -e "${GREEN}${CODESPACE_NAME}${NC}"
 
     echo -ne "  ${DIM}├─${NC} Force Kill Engine : "
-    stop_xray >/dev/null 2>&1
-    log_event INFO "force_reconnect stopped_previous_engine"
-    echo -e "${GREEN}Done${NC}"
+    if stop_xray >/dev/null 2>&1; then
+        log_event INFO "force_reconnect stopped_previous_engine"
+        echo -e "${GREEN}Done${NC}"
+    else
+        failed=1
+        log_event ERROR "force_reconnect stop_engine failed"
+        echo -e "${RED}Failed${NC}"
+    fi
 
     echo -ne "  ${DIM}├─${NC} Start Engine      : "
     if start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1; then
         log_event INFO "force_reconnect start_engine ok port=${XRAY_PORT}"
         echo -e "${GREEN}OK${NC}"
     else
+        failed=1
         log_event ERROR "force_reconnect start_engine failed port=${XRAY_PORT}"
         echo -e "${RED}Failed${NC}"
     fi
@@ -849,6 +863,7 @@ force_reconnect() {
         log_event INFO "force_reconnect expose_tunnel ok port=${XRAY_PORT}"
         echo -e "${GREEN}Done${NC}"
     else
+        failed=1
         log_event WARN "force_reconnect expose_tunnel failed port=${XRAY_PORT}"
         echo -e "${YELLOW}Needs PORTS tab${NC}"
     fi
@@ -861,12 +876,14 @@ force_reconnect() {
         sleep 2
     done
     log_event INFO "force_reconnect verify_external edge_reachable=${edge_reachable} code=${code:-none} domain=${PORT_DOMAIN}"
+    [[ "$edge_reachable" == true ]] || failed=1
     [[ "$edge_reachable" == true ]] \
         && echo -e "${GREEN}Edge reachable (HTTP ${code})${NC}\n" \
         || echo -e "${YELLOW}Pending / delayed (HTTP ${code:-0})${NC}\n"
 
-    [[ "$no_prompt" == "--no-prompt" ]] && { sleep 1; return; }
+    [[ "$no_prompt" == "--no-prompt" ]] && { sleep 1; return "$failed"; }
     echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
+    return 0
 }
 
 if [[ "${1:-}" == "--silent-start" ]]; then
@@ -911,7 +928,7 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     fi
 else
     refresh_screen
-    force_reconnect --no-prompt
+    force_reconnect --no-prompt || true
 fi
 
 while true; do
@@ -990,8 +1007,7 @@ while true; do
             fi
             _VLESS_PRIMARY="${_CONFIG_LINKS[0]:-}"
             [[ -z "$_VLESS_PRIMARY" ]] && { echo -e "  ${RED}✖ Error generating link.${NC}"; sleep 2; continue; }
-            printf '%s\n' "${_CONFIG_LINKS[@]}" > "$MOBILE_CONFIG_FILE"
-            refresh_config_exports >/dev/null 2>&1 || true
+            write_config_exports_from_links "${_CONFIG_LINKS[@]}" >/dev/null 2>&1 || true
             _VHASH=$(printf '%s' "$_VLESS_PRIMARY" | md5sum | awk '{print $1}')
             _PFLAG="$DATA_DIR/.prompted_${_VHASH}"
             if [[ ! -f "$_PFLAG" ]]; then

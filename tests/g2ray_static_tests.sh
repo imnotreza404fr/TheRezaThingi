@@ -5,6 +5,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SCRIPT="$ROOT_DIR/g2ray.sh"
 GITIGNORE="$ROOT_DIR/.gitignore"
+GITATTRIBUTES="$ROOT_DIR/.gitattributes"
+README="$ROOT_DIR/README.md"
+CONFIGS="$ROOT_DIR/configs.txt"
 DOCKERFILE="$ROOT_DIR/.devcontainer/Dockerfile"
 
 fail() {
@@ -116,6 +119,15 @@ test_generated_files_are_ignored() {
     pass 'generated runtime files are ignored'
 }
 
+test_shell_files_are_lf_normalized() {
+    [[ -f "$GITATTRIBUTES" ]] || fail '.gitattributes is missing'
+    grep_fixed '*.sh text eol=lf' "$GITATTRIBUTES" \
+        || fail '.gitattributes does not force shell scripts to LF'
+    grep_fixed 'tests/*.sh text eol=lf' "$GITATTRIBUTES" \
+        || fail '.gitattributes does not force test shell scripts to LF'
+    pass 'shell files are LF-normalized for Linux Bash'
+}
+
 test_xray_version_can_be_pinned() {
     grep_fixed 'ARG XRAY_VERSION=' "$DOCKERFILE" \
         || fail 'Dockerfile does not expose XRAY_VERSION for reproducible builds'
@@ -210,8 +222,13 @@ test_generated_links_include_domain_and_ip_variants() {
         || fail 'QR renderer does not use compact terminal QR output'
     grep_fixed 'printf '\''%s\n'\'' "$link"' "$SCRIPT" \
         || fail 'config links are not printed as raw copy-ready lines'
-    grep_fixed 'printf '\''%s\n'\'' "${_CONFIG_LINKS[@]}" > "$MOBILE_CONFIG_FILE"' "$SCRIPT" \
-        || fail 'mobile config file is not written from the full ordered config list'
+    grep_fixed 'write_config_exports_from_links()' "$SCRIPT" \
+        || fail 'script does not provide an export writer for an existing displayed link list'
+    grep_fixed 'write_config_exports_from_links "${_CONFIG_LINKS[@]}"' "$SCRIPT" \
+        || fail 'display path does not export the exact links it shows'
+    if grep_fixed 'printf '\''%s\n'\'' "${_CONFIG_LINKS[@]}" > "$MOBILE_CONFIG_FILE"' "$SCRIPT"; then
+        fail 'display path still writes mobile config directly before recomputing exports'
+    fi
     grep_fixed 'Recommended IP link' "$SCRIPT" \
         || fail 'display does not label the primary IP config clearly'
     grep_fixed 'Domain link' "$SCRIPT" \
@@ -258,11 +275,21 @@ test_runtime_diagnostics_logging() {
         || fail 'external reconnect verification does not distinguish reachable HTTP edge responses from connection failure'
     grep_fixed 'verify_external edge_reachable=' "$SCRIPT" \
         || fail 'external reconnect verification does not log whether the Codespaces edge is reachable'
+    grep_fixed 'local no_prompt="${1:-}" failed=0' "$SCRIPT" \
+        || fail 'force reconnect does not track failure state'
+    grep_fixed 'if stop_xray >/dev/null 2>&1; then' "$SCRIPT" \
+        || fail 'force reconnect does not handle stop_xray failure explicitly'
+    grep_fixed 'return "$failed"' "$SCRIPT" \
+        || fail 'force reconnect does not return failure to the watchdog'
     if grep_fixed 'verify_external reachable=' "$SCRIPT"; then
         fail 'external reconnect verification still uses ambiguous reachable logging'
     fi
-    grep_fixed 'log_event INFO "resolver domain=' "$SCRIPT" \
-        || fail 'resolver does not log resolved fallback IP candidates'
+    grep_fixed 'fallback_candidates=' "$SCRIPT" \
+        || fail 'resolver does not log mixed fallback IP candidates clearly'
+    grep_fixed 'Fallback IP Candidates' "$SCRIPT" \
+        || fail 'diagnostics still labels mixed fallback candidates as purely resolved IPs'
+    grep_fixed 'includes resolved, manual, and built-in fallbacks' "$SCRIPT" \
+        || fail 'diagnostics does not disclose that fallback IPs may include built-in candidates'
     grep_fixed 'curl_remote_ip()' "$SCRIPT" \
         || fail 'script does not use curl remote_ip as a resolver fallback'
     grep_fixed 'curl_remote_ip "$domain"' "$SCRIPT" \
@@ -306,6 +333,14 @@ test_runtime_diagnostics_logging() {
     pass 'runtime diagnostics logging is present'
 }
 
+test_docs_and_public_configs_are_consistent() {
+    grep_fixed '1-to-14' "$README" \
+        || fail 'README menu count is stale'
+    awk 'NF && seen[$0]++ { dup=1 } END { exit dup ? 1 : 0 }' "$CONFIGS" \
+        || fail 'configs.txt contains duplicate non-empty VLESS entries'
+    pass 'docs and public configs are consistent'
+}
+
 test_wait_for_port_increment_is_set_e_safe
 test_process_management_uses_pid_file
 test_background_tasks_uses_owned_pid_file
@@ -314,8 +349,10 @@ test_port_visibility_failures_are_handled
 test_self_update_is_opt_in
 test_exit_trap_preserves_failures
 test_generated_files_are_ignored
+test_shell_files_are_lf_normalized
 test_xray_version_can_be_pinned
 test_generated_config_uses_resilient_dns_fallback
 test_generated_links_include_domain_and_ip_variants
 test_terminal_branding_is_customized_red
 test_runtime_diagnostics_logging
+test_docs_and_public_configs_are_consistent

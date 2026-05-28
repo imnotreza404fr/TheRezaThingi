@@ -97,7 +97,7 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 
 ## Usage
 
-When launched, the panel provides a 1-to-13 numerical selection menu. Simply type the number corresponding to the action you want to take.
+When launched, the panel provides a 1-to-14 numerical selection menu. Simply type the number corresponding to the action you want to take.
 
 ```bash
 # If panel did now get shown:
