@@ -134,6 +134,8 @@ test_generated_links_include_domain_and_ip_variants() {
         || fail 'script does not allow manually supplied fallback IPs'
     grep_fixed 'DEFAULT_FALLBACK_IPS=' "$SCRIPT" \
         || fail 'script does not provide built-in fallback IPs for DNS-blocked networks'
+    grep_fixed '20.85.77.48 20.207.70.99 20.120.56.11' "$SCRIPT" \
+        || fail 'built-in fallback IPs do not prefer the current East US tunnel edges before the historical fallback'
     grep_fixed '20.120.56.11' "$SCRIPT" \
         || fail 'script does not include the historically working East US tunnel IP'
     grep_fixed 'dns.google/resolve' "$SCRIPT" \
