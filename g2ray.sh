@@ -380,6 +380,46 @@ stop_xray() {
     sleep 0.5
 }
 
+upgrade_config_dns() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    if ! command -v jq >/dev/null 2>&1; then
+        log_event WARN "config_dns jq_unavailable"
+        return 0
+    fi
+
+    local tmp
+    tmp=$(mktemp "${CONFIG_FILE}.dns.XXXXXX") || return 0
+    if jq '
+      .dns = {
+        "hosts": {
+          "dns.google": ["8.8.8.8", "8.8.4.4"],
+          "cloudflare-dns.com": ["1.1.1.1", "1.0.0.1"]
+        },
+        "servers": [
+          { "address": "https+local://1.1.1.1/dns-query", "queryStrategy": "UseIPv4", "timeoutMs": 2500 },
+          { "address": "https+local://dns.google/dns-query", "queryStrategy": "UseIPv4", "timeoutMs": 2500 },
+          { "address": "1.0.0.1", "queryStrategy": "UseIPv4", "timeoutMs": 2000 },
+          { "address": "8.8.4.4", "queryStrategy": "UseIPv4", "timeoutMs": 2000 },
+          "localhost"
+        ],
+        "queryStrategy": "UseIPv4",
+        "disableFallback": false,
+        "disableFallbackIfMatch": false,
+        "enableParallelQuery": true
+      }
+    ' "$CONFIG_FILE" > "$tmp" 2>/dev/null; then
+        if cmp -s "$CONFIG_FILE" "$tmp"; then
+            rm -f "$tmp" 2>/dev/null || true
+        else
+            mv -f "$tmp" "$CONFIG_FILE"
+            log_event INFO "config_dns refreshed"
+        fi
+    else
+        rm -f "$tmp" 2>/dev/null || true
+        log_event WARN "config_dns refresh_failed"
+    fi
+}
+
 start_xray() {
     if [[ ! -f "$CONFIG_FILE" ]]; then
         log_event WARN "start_xray missing_config path=${CONFIG_FILE}"
@@ -395,6 +435,7 @@ start_xray() {
         echo -e "  ${RED}✖ Could not stop previous Xray process.${NC}"
         return 1
     fi
+    upgrade_config_dns >/dev/null 2>&1 || true
     reset_session_bytes_baseline
     pid=$(sudo bash -c "$launch_cmd" 2>/dev/null || true)
     if [[ ! "$pid" =~ ^[0-9]+$ ]]; then

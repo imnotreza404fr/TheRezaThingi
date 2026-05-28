@@ -142,6 +142,14 @@ test_generated_config_uses_resilient_dns_fallback() {
         || fail 'generated Xray DNS config does not include Google UDP fallback'
     grep_fixed '"timeoutMs": 2500' "$SCRIPT" \
         || fail 'generated Xray DNS config does not bound DoH resolver wait time'
+    grep_fixed 'upgrade_config_dns()' "$SCRIPT" \
+        || fail 'script does not provide an in-place DNS migration for existing configs'
+    grep_fixed '.dns = {' "$SCRIPT" \
+        || fail 'existing config DNS migration does not replace the dns object'
+    grep_fixed 'upgrade_config_dns >/dev/null 2>&1 || true' "$SCRIPT" \
+        || fail 'start path does not apply DNS migration before launching Xray'
+    grep_fixed 'config_dns refreshed' "$SCRIPT" \
+        || fail 'DNS migration does not log when it refreshes an existing config'
     if grep_fixed '"domains": ["geosite:geolocation-!cn"]' "$SCRIPT"; then
         fail 'generated Xray DNS config still pins most lookups to a single domain-matched resolver before fallback'
     fi
