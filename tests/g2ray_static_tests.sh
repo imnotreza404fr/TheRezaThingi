@@ -66,6 +66,17 @@ test_background_tasks_uses_owned_pid_file() {
         || fail 'script does not validate that the background PID belongs to a live g2ray process'
     grep_fixed 'bg_tasks_running "$p"' "$SCRIPT" \
         || fail 'start_background_tasks does not validate background PID ownership'
+    grep_fixed 'BG_TASKS_LOCK_DIR=' "$SCRIPT" \
+        || fail 'background supervisor startup is not protected by an atomic lock'
+    grep_fixed 'BG_TASKS_TOKEN_FILE=' "$SCRIPT" \
+        || fail 'background supervisor does not persist an ownership token'
+    grep_fixed 'G2RAY_BG_TASK_TOKEN=' "$SCRIPT" \
+        || fail 'background supervisor process is not tagged with an ownership token'
+    grep_fixed '/proc/$p/environ' "$SCRIPT" \
+        || fail 'background supervisor ownership is not verified against the live process environment'
+    if grep_fixed 'grep -Fq "g2ray.sh"' "$SCRIPT"; then
+        fail 'background supervisor ownership still matches any process whose args contain g2ray.sh'
+    fi
     pass 'background supervisor validates PID ownership'
 }
 
@@ -116,6 +127,9 @@ test_generated_files_are_ignored() {
     for pattern in '/data/' '/logs/' '/configs-to-copy-for-mobile.txt' '/configs-subscription-base64.txt'; do
         grep_fixed "$pattern" "$GITIGNORE" || fail ".gitignore missing $pattern"
     done
+    for pattern in '/configs-to-copy-for-mobile.txt.*' '/configs-subscription-base64.txt.*'; do
+        grep_fixed "$pattern" "$GITIGNORE" || fail ".gitignore missing atomic temp pattern $pattern"
+    done
     pass 'generated runtime files are ignored'
 }
 
@@ -134,6 +148,10 @@ test_xray_version_can_be_pinned() {
     if grep_fixed 'releases/latest/download' "$DOCKERFILE"; then
         fail 'Dockerfile still downloads Xray from latest'
     fi
+    grep_fixed 'Xray-linux-64.zip.dgst' "$DOCKERFILE" \
+        || fail 'Dockerfile does not download Xray digest metadata'
+    grep_fixed 'sha256sum -c -' "$DOCKERFILE" \
+        || fail 'Dockerfile does not verify Xray zip checksum before installing'
     pass 'Dockerfile supports pinned Xray version'
 }
 
@@ -333,6 +351,24 @@ test_runtime_diagnostics_logging() {
     pass 'runtime diagnostics logging is present'
 }
 
+test_runtime_control_paths_are_hardened() {
+    grep_fixed 'XRAY_PORT="${XRAY_PORT:-443}"' "$SCRIPT" \
+        || fail 'XRAY_PORT documentation says it is configurable, but script still hard-codes 443'
+    grep_fixed 'valid_codespace_name()' "$SCRIPT" \
+        || fail 'codespace detection does not validate candidate names'
+    grep_fixed '[[ "$name" != "null" ]]' "$SCRIPT" \
+        || fail 'codespace detection can accept literal null as a real name'
+    grep_fixed 'xray_listener_ready()' "$SCRIPT" \
+        || fail 'engine readiness does not verify the Xray/XHTTP listener, only an open port'
+    grep_fixed 'while ! xray_listener_ready && (( i < 15 )); do' "$SCRIPT" \
+        || fail 'wait_for_port still succeeds on any listener bound to the port'
+    grep_fixed 'log_event WARN "silent_start stop_previous_failed"' "$SCRIPT" \
+        || fail '--silent-start can still exit early when stop_xray fails under set -e'
+    grep_fixed 'if stop_xray; then' "$SCRIPT" \
+        || fail 'interactive Stop Engine path does not handle stop_xray failure'
+    pass 'runtime control paths are hardened'
+}
+
 test_xhttp_route_settling_is_observable() {
     grep_fixed 'BG_TASKS_VERSION_FILE=' "$SCRIPT" \
         || fail 'background supervisor does not record a script version marker'
@@ -371,6 +407,20 @@ test_docs_and_public_configs_are_consistent() {
         || fail 'README does not document G2RAY_QR_MODE'
     grep_fixed 'G2RAY_EXTRA_FALLBACK_IPS' "$README" \
         || fail 'README does not document G2RAY_EXTRA_FALLBACK_IPS'
+    grep_fixed '<details><summary><kbd>🔗</kbd> Community Donated Configs (SUB)</summary>' "$README" \
+        || fail 'README community subscription summary is not wrapped in a details block'
+    if grep_fixed 'without impacting your own speed or exposing personal data' "$README"; then
+        fail 'README still claims donated live configs expose no personal data'
+    fi
+    if grep_fixed 'No impact on your speed, quota, or security' "$SCRIPT" || grep_fixed 'no extra risk' "$SCRIPT"; then
+        fail 'CLI donation prompt still understates the live-config sharing tradeoff'
+    fi
+    grep_fixed 'shares the live VLESS link' "$README" \
+        || fail 'README does not disclose what donation shares'
+    grep_fixed 'This shares your live VLESS link publicly.' "$SCRIPT" \
+        || fail 'CLI donation prompt does not disclose that it shares the live VLESS link'
+    grep_fixed 'allowInsecure=1' "$README" \
+        || fail 'README does not disclose the TLS verification tradeoff in exported links'
     awk 'NF && seen[$0]++ { dup=1 } END { exit dup ? 1 : 0 }' "$CONFIGS" \
         || fail 'configs.txt contains duplicate non-empty VLESS entries'
     pass 'docs and public configs are consistent'
@@ -415,6 +465,21 @@ test_menu_loop_and_link_output_are_tidy() {
     pass 'menu loop and link output are tidy'
 }
 
+test_donation_failures_are_not_suppressed() {
+    grep_fixed 'return 0' "$SCRIPT" \
+        || fail 'donation sender does not return success explicitly'
+    grep_fixed 'return 1' "$SCRIPT" \
+        || fail 'donation sender does not return failure explicitly'
+    grep_fixed 'send_to_vless_forwarder "$vless" && touch' "$SCRIPT" \
+        || fail 'manual donation marks config as prompted even when sending fails'
+    grep_fixed 'send_to_vless_forwarder "$_VLESS_PRIMARY" && touch "$_PFLAG"' "$SCRIPT" \
+        || fail 'first-view donation prompt is suppressed even when sending fails'
+    if grep_fixed 'send_to_vless_forwarder "$_VLESS_PRIMARY"; sleep 1; }' "$SCRIPT"; then
+        fail 'first-view donation still ignores send_to_vless_forwarder failure'
+    fi
+    pass 'donation failures are not suppressed'
+}
+
 test_wait_for_port_increment_is_set_e_safe
 test_process_management_uses_pid_file
 test_background_tasks_uses_owned_pid_file
@@ -430,6 +495,8 @@ test_generated_links_include_domain_and_ip_variants
 test_terminal_branding_is_customized_red
 test_runtime_diagnostics_logging
 test_xhttp_route_settling_is_observable
+test_runtime_control_paths_are_hardened
 test_docs_and_public_configs_are_consistent
 test_devcontainer_tooling_is_not_duplicated
 test_menu_loop_and_link_output_are_tidy
+test_donation_failures_are_not_suppressed

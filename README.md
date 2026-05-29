@@ -34,13 +34,15 @@ G2ray is a powerful, interactive Bash panel designed to instantly deploy and man
 
 ---
 
-<summary><kbd>🔗</kbd> Community Donated Configs (SUB)</summary>
+<details><summary><kbd>🔗</kbd> Community Donated Configs (SUB)</summary>
 
-Want to use public nodes donated by other G2ray users? Import this subscription link directly into your V2ray/Xray client:
+Want to use public nodes donated by other G2ray users? Import this raw newline-separated list into clients that support plain VLESS subscriptions:
 
 ```text
 https://raw.githubusercontent.com/Code-Leafy/G2rayXCodeLeafy/main/configs.txt
 ```
+
+</details>
 
 ---
 
@@ -56,7 +58,7 @@ Built-in background loops and advanced Tmux simulators prevent GitHub Codespaces
 Tracks real-time RX/TX data consumption and actively monitors resource usage (CPU/RAM). It accurately estimates your remaining 60-hour free-tier quota.
 
 #### 📦 Community Config Network
-Donate your generated config directly from the CLI to share access with the community securely, without impacting your own speed or exposing personal data.
+Donate your generated config directly from the CLI to share access with the community. Donation shares the live VLESS link, including its UUID, Codespaces endpoint, and link label, so only donate configs you intentionally want public.
 
 <div align="center">
 
@@ -92,6 +94,8 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `CODESPACE_NAME` **(Optional)** — Overrides auto-detection of the app domain.
 - `G2RAY_QR_MODE` **(Optional)** — Controls QR display in the config view: `recommended` (default), `all`, or `none`.
 - `G2RAY_EXTRA_FALLBACK_IPS` **(Optional)** — Adds comma-, semicolon-, or space-separated IP fallback candidates before auto-detected ones.
+
+Generated links include `allowInsecure=1` for compatibility with IP fallback links that still route through the Codespaces SNI/Host. This is a compatibility tradeoff: clients that honor the flag may relax TLS certificate verification.
 
 </details>
 

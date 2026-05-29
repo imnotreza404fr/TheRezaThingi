@@ -13,6 +13,8 @@ CONFIG_FILE="$DATA_DIR/config.json"
 UUID_FILE="$DATA_DIR/uuid.txt"
 BG_TASKS_PID="$DATA_DIR/bg_tasks.pid"
 BG_TASKS_VERSION_FILE="$DATA_DIR/bg_tasks.version"
+BG_TASKS_LOCK_DIR="$DATA_DIR/bg_tasks.lock"
+BG_TASKS_TOKEN_FILE="$DATA_DIR/bg_tasks.token"
 ROUTE_BAD_COUNT_FILE="$DATA_DIR/xhttp_route_bad_count"
 XRAY_PID_FILE="$DATA_DIR/xray.pid"
 SAVED_BYTES_FILE="$DATA_DIR/saved_bytes.json"
@@ -24,7 +26,7 @@ LOG_FILE="$LOG_DIR/g2ray.log"
 MOBILE_CONFIG_FILE="$BASE_DIR/configs-to-copy-for-mobile.txt"
 SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
 XRAY_BIN="/usr/local/bin/xray"
-XRAY_PORT=443
+XRAY_PORT="${XRAY_PORT:-443}"
 DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.85.77.48 20.207.70.99 20.120.56.11}"
 
 mkdir -p "$DATA_DIR" "$LOG_DIR"
@@ -42,6 +44,11 @@ log_event() {
     printf '%s [%s] %s\n' "$ts" "$level" "$msg" >> "$LOG_FILE" 2>/dev/null || true
 }
 
+valid_codespace_name() {
+    local name="${1:-}"
+    [[ -n "$name" ]] && [[ "$name" != "null" ]]
+}
+
 fingerprint_secret() {
     local value="$1"
     if command -v sha256sum >/dev/null 2>&1; then
@@ -52,16 +59,16 @@ fingerprint_secret() {
 }
 
 _detect_codespace_name() {
-    [[ -n "${CODESPACE_NAME:-}" ]] && { printf '%s' "$CODESPACE_NAME"; return; }
+    valid_codespace_name "${CODESPACE_NAME:-}" && { printf '%s' "$CODESPACE_NAME"; return; }
     if command -v gh >/dev/null 2>&1; then
         local n
         n=$(GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 GH_FORCE_TTY=0 \
-            gh codespace list --limit 1 --json name --jq '.[0].name' 2>/dev/null || true)
-        [[ -n "$n" ]] && { printf '%s' "$n"; return; }
+            gh codespace list --limit 1 --json name --jq '.[0].name // ""' 2>/dev/null || true)
+        valid_codespace_name "$n" && { printf '%s' "$n"; return; }
         sleep 2
         n=$(GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 GH_FORCE_TTY=0 \
-            gh codespace list --limit 1 --json name --jq '.[0].name' 2>/dev/null || true)
-        [[ -n "$n" ]] && { printf '%s' "$n"; return; }
+            gh codespace list --limit 1 --json name --jq '.[0].name // ""' 2>/dev/null || true)
+        valid_codespace_name "$n" && { printf '%s' "$n"; return; }
     fi
     local h; h=$(hostname 2>/dev/null || true)
     printf '%s' "${h:-unknown-codespace}"
@@ -298,7 +305,8 @@ send_to_vless_forwarder() {
     local link="$1"
     local url="https://script.google.com/macros/s/AKfycbwtsJZhhaBjPILq0wY3saytWmWtQFD6aXXwmHnX_i_BX5OCMLiVrXPutCxM-ejPafVGsg/exec"
     if ! command -v jq >/dev/null 2>&1; then
-        echo -e "  ${RED}✖ jq unavailable — cannot donate config.${NC}"; return 1
+        echo -e "  ${RED}✖ jq unavailable — cannot donate config.${NC}"
+        return 1
     fi
     local payload; payload=$(jq -n --arg m "$link" '{message:$m}')
     echo -e "  ${YELLOW}Sending config to developer network...${NC}"
@@ -306,11 +314,14 @@ send_to_vless_forwarder() {
             -d "$payload" "$url" </dev/null > /tmp/gas_resp.txt 2>&1; then
         if grep -q "Appended to GitHub" /tmp/gas_resp.txt; then
             echo -e "  ${GREEN}✔ Config donated successfully! Thank you.${NC}"
+            return 0
         else
             echo -e "  ${RED}✖ Donation endpoint rejected.${NC}"
+            return 1
         fi
     else
         echo -e "  ${RED}✖ Could not reach donation endpoint.${NC}"
+        return 1
     fi
 }
 
@@ -320,6 +331,14 @@ is_port_open() {
     else
         sudo netstat -tnl 2>/dev/null | grep -q ":${XRAY_PORT}[[:space:]]"
     fi
+}
+
+xray_listener_ready() {
+    xray_running || return 1
+    is_port_open || return 1
+    local code
+    code=$(xhttp_probe_status local)
+    xhttp_status_usable "$code"
 }
 
 ensure_codespace_port_public() {
@@ -507,14 +526,14 @@ start_xray() {
 wait_for_port() {
     local i=0 frame_index=0
     local frames=("-" "\\" "|" "/")
-    while ! is_port_open && (( i < 15 )); do
+    while ! xray_listener_ready && (( i < 15 )); do
         printf "\r  ${GREEN}%s${NC} ${DIM}Initializing engine... (${i}s)${NC}" "${frames[$frame_index]}"
         frame_index=$(( (frame_index + 1) % ${#frames[@]} ))
         sleep 1
         i=$((i + 1))
     done
     printf "\r  ${GREEN}%s${NC} ${DIM}Initializing engine... (${i}s)${NC}        \n" "${frames[$frame_index]}"
-    if is_port_open; then
+    if xray_listener_ready; then
         log_event INFO "wait_for_port open port=${XRAY_PORT} seconds=${i}"
         return 0
     fi
@@ -542,7 +561,7 @@ self_heal_once() {
 
     if ! xray_running; then
         reason=xray_stopped
-    elif ! is_port_open; then
+    elif ! xray_listener_ready; then
         reason=listener_closed
     fi
 
@@ -601,21 +620,54 @@ _background_tasks() {
     done
 }
 
+acquire_bg_tasks_lock() {
+    local i lock_pid
+    for i in {1..20}; do
+        if mkdir "$BG_TASKS_LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" > "$BG_TASKS_LOCK_DIR/pid" 2>/dev/null || true
+            return 0
+        fi
+        lock_pid=$(cat "$BG_TASKS_LOCK_DIR/pid" 2>/dev/null || true)
+        if [[ "$lock_pid" =~ ^[0-9]+$ ]] && ! kill -0 "$lock_pid" 2>/dev/null; then
+            rm -f "$BG_TASKS_LOCK_DIR/pid" 2>/dev/null || true
+            rmdir "$BG_TASKS_LOCK_DIR" 2>/dev/null || true
+            continue
+        fi
+        sleep 0.1
+    done
+    log_event WARN "background lock_busy"
+    return 1
+}
+
+release_bg_tasks_lock() {
+    rm -f "$BG_TASKS_LOCK_DIR/pid" 2>/dev/null || true
+    rmdir "$BG_TASKS_LOCK_DIR" 2>/dev/null || true
+}
+
 start_background_tasks() {
+    local token bg_pid
+    if ! acquire_bg_tasks_lock; then
+        return 0
+    fi
     if [[ -f "$BG_TASKS_PID" ]]; then
         local p; p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
-        if bg_tasks_running "$p"; then
-            if background_supervisor_version_matches; then
+        if bg_tasks_running "$p" || legacy_bg_tasks_running "$p"; then
+            if bg_tasks_running "$p" && background_supervisor_version_matches; then
+                release_bg_tasks_lock
                 return 0
             fi
             log_event WARN "background supervisor_stale pid=${p}"
             stop_background_tasks
         fi
     fi
-    _background_tasks </dev/null >/dev/null 2>&1 &
-    printf '%s\n' $! > "$BG_TASKS_PID"
+    token=$(uuidgen 2>/dev/null || printf '%s-%s-%s' "$$" "$RANDOM" "$(date +%s)")
+    printf '%s\n' "$token" > "$BG_TASKS_TOKEN_FILE"
+    G2RAY_BG_TASK_TOKEN="$token" _background_tasks </dev/null >/dev/null 2>&1 &
+    bg_pid=$!
+    printf '%s\n' "$bg_pid" > "$BG_TASKS_PID"
     background_supervisor_version > "$BG_TASKS_VERSION_FILE" 2>/dev/null || true
-    log_event INFO "background supervisor_started pid=$!"
+    log_event INFO "background supervisor_started pid=${bg_pid}"
+    release_bg_tasks_lock
     disown 2>/dev/null || true
 }
 
@@ -639,19 +691,34 @@ background_supervisor_version_matches() {
 stop_background_tasks() {
     local p
     p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
-    if bg_tasks_running "$p"; then
+    if bg_tasks_running "$p" || legacy_bg_tasks_running "$p"; then
         kill "$p" >/dev/null 2>&1 || true
         sleep 1
-        bg_tasks_running "$p" && kill -9 "$p" >/dev/null 2>&1 || true
+        (bg_tasks_running "$p" || legacy_bg_tasks_running "$p") && kill -9 "$p" >/dev/null 2>&1 || true
     fi
-    rm -f "$BG_TASKS_PID" "$BG_TASKS_VERSION_FILE" 2>/dev/null || true
+    rm -f "$BG_TASKS_PID" "$BG_TASKS_VERSION_FILE" "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true
+}
+
+legacy_bg_tasks_running() {
+    local p="${1:-}" args tty
+    [[ -f "$BG_TASKS_TOKEN_FILE" ]] && return 1
+    [[ "$p" =~ ^[0-9]+$ ]] || return 1
+    kill -0 "$p" 2>/dev/null || return 1
+    args=$(ps -p "$p" -o args= 2>/dev/null || true)
+    tty=$(ps -p "$p" -o tty= 2>/dev/null | awk '{print $1}' || true)
+    [[ "$tty" == "?" && ( "$args" == *"$BASE_DIR/g2ray.sh"* || "$args" == *"g2ray.sh"* ) ]]
 }
 
 bg_tasks_running() {
-    local p="${1:-}"
+    local p="${1:-}" expected
     [[ "$p" =~ ^[0-9]+$ ]] || return 1
     kill -0 "$p" 2>/dev/null || return 1
-    ps -p "$p" -o args= 2>/dev/null | grep -Fq "g2ray.sh"
+    expected=$(cat "$BG_TASKS_TOKEN_FILE" 2>/dev/null || true)
+    if [[ -n "$expected" && -r "/proc/$p/environ" ]]; then
+        tr '\0' '\n' < "/proc/$p/environ" 2>/dev/null | grep -Fxq "G2RAY_BG_TASK_TOKEN=$expected"
+        return
+    fi
+    return 1
 }
 
 format_bytes() {
@@ -699,11 +766,11 @@ show_resource_stats() {
 }
 
 check_port_visibility() {
-    if ! is_port_open; then
+    if ! xray_listener_ready; then
         log_event WARN "check_port_visibility engine_not_running port=${XRAY_PORT}"
         refresh_screen
-        echo -e "  ${RED}✖ Engine is not running!${NC}"
-        echo -e "  ${DIM}Start the engine first (Option 3).${NC}\n"
+        echo -e "  ${RED}✖ Engine is not ready!${NC}"
+        echo -e "  ${DIM}Start or reconnect the engine first (Option 3 or 6).${NC}\n"
         echo -ne "  ${DIM}Press Enter to return...${NC}"; read -r
         return 1
     fi
@@ -875,12 +942,12 @@ do_donate_config() {
     refresh_screen
     echo -e "\n  ${GREEN}● Donate Configuration${NC}"
     echo -e "  ${WHITE}Help others connect securely for free.${NC}"
-    echo -e "  ${DIM}• No speed or quota penalty.\n  • IP is already public; no extra risk.${NC}\n"
+    echo -e "  ${DIM}This shares your live VLESS link publicly.${NC}"
+    echo -e "  ${DIM}Only donate configs you intentionally want others to use.${NC}\n"
     echo -ne "  ${GREEN}╰─❯${NC} Confirm donation? (y/n): "
     read -r d
     if [[ "$d" =~ ^[Yy]$ ]]; then
-        send_to_vless_forwarder "$vless"
-        touch "$DATA_DIR/.prompted_$(printf '%s' "$vless" | md5sum | awk '{print $1}')"
+        send_to_vless_forwarder "$vless" && touch "$DATA_DIR/.prompted_$(printf '%s' "$vless" | md5sum | awk '{print $1}')"
     fi
     sleep 2
 }
@@ -1038,7 +1105,9 @@ force_reconnect() {
 }
 
 if [[ "${1:-}" == "--silent-start" ]]; then
-    stop_xray >/dev/null 2>&1
+    if ! stop_xray >/dev/null 2>&1; then
+        log_event WARN "silent_start stop_previous_failed"
+    fi
     if [[ -f "$CONFIG_FILE" ]] && start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1; then
         ensure_codespace_port_public >/dev/null 2>&1 || true
     fi
@@ -1164,11 +1233,16 @@ while true; do
                 refresh_screen
                 echo -e "  ${GREEN}🎉 Node is Ready!${NC}\n"
                 echo -e "  ${WHITE}Donate this config to help others connect freely?${NC}"
-                echo -e "  ${DIM}(No impact on your speed, quota, or security)${NC}\n"
+                echo -e "  ${DIM}This shares your live VLESS link publicly.${NC}"
+                echo -e "  ${DIM}Only donate configs you intentionally want others to use.${NC}\n"
                 echo -ne "  ${GREEN}╰─❯${NC} Donate? (y/n): "
                 read -r _share
-                [[ "$_share" =~ ^[Yy]$ ]] && { send_to_vless_forwarder "$_VLESS_PRIMARY"; sleep 1; }
-                touch "$_PFLAG"
+                if [[ "$_share" =~ ^[Yy]$ ]]; then
+                    send_to_vless_forwarder "$_VLESS_PRIMARY" && touch "$_PFLAG"
+                    sleep 1
+                else
+                    touch "$_PFLAG"
+                fi
             fi
             refresh_screen
             echo -e "  ${RED}● Configs & Compact QR Codes${NC}"
@@ -1210,8 +1284,11 @@ while true; do
             sleep 1
             ;;
         4)
-            stop_xray
-            echo -e "\n  ${RED}■ Engine stopped.${NC}"
+            if stop_xray; then
+                echo -e "\n  ${RED}■ Engine stopped.${NC}"
+            else
+                echo -e "\n  ${RED}✖ Could not fully stop the engine. Check diagnostics.${NC}"
+            fi
             sleep 1
             ;;
         5)
