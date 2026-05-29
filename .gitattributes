@@ -4,6 +4,7 @@ tests/*.sh text eol=lf
 *.md text eol=lf
 *.txt text eol=lf
 *.json text eol=lf
+*.yml text eol=lf
 .devcontainer/Dockerfile text eol=lf
 assets/message.txt text eol=lf
 .gitignore text eol=lf

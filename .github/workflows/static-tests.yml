@@ -1,0 +1,18 @@
+name: Static Tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  bash-static-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Syntax check panel
+        run: bash -n ./g2ray.sh
+
+      - name: Run static regression tests
+        run: bash ./tests/g2ray_static_tests.sh

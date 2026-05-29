@@ -15,7 +15,10 @@ BG_TASKS_PID="$DATA_DIR/bg_tasks.pid"
 BG_TASKS_VERSION_FILE="$DATA_DIR/bg_tasks.version"
 BG_TASKS_LOCK_DIR="$DATA_DIR/bg_tasks.lock"
 BG_TASKS_TOKEN_FILE="$DATA_DIR/bg_tasks.token"
+BG_TASKS_HEARTBEAT_FILE="$DATA_DIR/bg_tasks.heartbeat"
 ROUTE_BAD_COUNT_FILE="$DATA_DIR/xhttp_route_bad_count"
+EDGE_BAD_COUNT_FILE="$DATA_DIR/edge_bad_count"
+EDGE_RECONNECT_STAMP_FILE="$DATA_DIR/edge_reconnect_last"
 XRAY_PID_FILE="$DATA_DIR/xray.pid"
 SAVED_BYTES_FILE="$DATA_DIR/saved_bytes.json"
 SESSION_BYTES_FILE="$DATA_DIR/session_bytes.json"
@@ -28,6 +31,9 @@ SUBSCRIPTION_FILE="$BASE_DIR/configs-subscription-base64.txt"
 XRAY_BIN="/usr/local/bin/xray"
 XRAY_PORT="${XRAY_PORT:-443}"
 DEFAULT_FALLBACK_IPS="${G2RAY_DEFAULT_FALLBACK_IPS:-20.85.77.48 20.207.70.99 20.120.56.11}"
+MAX_FALLBACK_LINKS="${G2RAY_MAX_FALLBACK_LINKS:-3}"
+SELF_HEAL_EDGE_RECONNECT_THRESHOLD="${G2RAY_EDGE_RECONNECT_THRESHOLD:-3}"
+SELF_HEAL_RECONNECT_COOLDOWN_SEC="${G2RAY_RECONNECT_COOLDOWN_SEC:-300}"
 
 mkdir -p "$DATA_DIR" "$LOG_DIR"
 touch "$LOG_FILE" 2>/dev/null || true
@@ -133,16 +139,30 @@ xhttp_config_path() {
     printf '/'
 }
 
-xhttp_probe_status() {
-    local target="${1:-external}" path code url
+xhttp_probe_metrics() {
+    local target="${1:-external}" address="${2:-}" path url raw code elapsed ms
     path=$(xhttp_config_path)
     [[ "$path" == /* ]] || path="/${path}"
     case "$target" in
         local) url="http://127.0.0.1:${XRAY_PORT}${path}" ;;
         *)     url="https://${PORT_DOMAIN}${path}" ;;
     esac
-    code=$(curl -sk -m 5 -X OPTIONS -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || echo "0")
+    if [[ "$target" == "local" || -z "$address" ]]; then
+        raw=$(curl -sk -m 5 -X OPTIONS -o /dev/null -w "%{http_code} %{time_total}" "$url" 2>/dev/null || echo "0 0")
+    else
+        raw=$(curl -sk -m 5 --resolve "${PORT_DOMAIN}:${XRAY_PORT}:${address}" \
+            -X OPTIONS -o /dev/null -w "%{http_code} %{time_total}" "$url" 2>/dev/null || echo "0 0")
+    fi
+    code=${raw%% *}
+    elapsed=${raw#* }
     [[ "$code" == "000" ]] && code=0
+    ms=$(awk -v s="${elapsed:-0}" 'BEGIN{printf "%d", (s * 1000) + 0.5}')
+    printf '%s %s\n' "${code:-0}" "${ms:-0}"
+}
+
+xhttp_probe_status() {
+    local target="${1:-external}" address="${2:-}" code
+    code=$(xhttp_probe_metrics "$target" "$address" | awk '{print $1}')
     printf '%s' "${code:-0}"
 }
 
@@ -162,6 +182,32 @@ increment_route_bad_count() {
 
 reset_route_bad_count() {
     rm -f "$ROUTE_BAD_COUNT_FILE" 2>/dev/null || true
+}
+
+increment_edge_bad_count() {
+    local count
+    count=$(cat "$EDGE_BAD_COUNT_FILE" 2>/dev/null || echo 0)
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    count=$((count + 1))
+    printf '%s\n' "$count" > "$EDGE_BAD_COUNT_FILE"
+    printf '%s' "$count"
+}
+
+reset_edge_bad_count() {
+    rm -f "$EDGE_BAD_COUNT_FILE" 2>/dev/null || true
+}
+
+edge_reconnect_cooldown_active() {
+    local now last cooldown="$SELF_HEAL_RECONNECT_COOLDOWN_SEC"
+    [[ "$cooldown" =~ ^[0-9]+$ ]] || cooldown=300
+    last=$(cat "$EDGE_RECONNECT_STAMP_FILE" 2>/dev/null || echo 0)
+    [[ "$last" =~ ^[0-9]+$ ]] || last=0
+    now=$(date +%s)
+    (( now - last < cooldown ))
+}
+
+mark_edge_reconnect_attempt() {
+    date +%s > "$EDGE_RECONNECT_STAMP_FILE" 2>/dev/null || true
 }
 
 resolve_domain_ips() {
@@ -542,18 +588,18 @@ wait_for_port() {
 }
 
 health_probe() {
-    local engine="stopped" listener="closed" code xcode xhttp_route_usable=false
+    local engine="stopped" listener="closed" code xcode xms xhttp_route_usable=false
     xray_running && engine="running"
     is_port_open && listener="open"
     code=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "https://${PORT_DOMAIN}" 2>/dev/null || echo "0")
-    xcode=$(xhttp_probe_status external)
+    read -r xcode xms < <(xhttp_probe_metrics external)
     xhttp_status_usable "$xcode" && xhttp_route_usable=true
-    log_event INFO "health engine=${engine} listener=${listener} external_code=${code:-0} xhttp_probe=${xcode:-0} xhttp_route_usable=${xhttp_route_usable} domain=${PORT_DOMAIN}"
+    log_event INFO "health engine=${engine} listener=${listener} external_code=${code:-0} xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} xhttp_route_usable=${xhttp_route_usable} domain=${PORT_DOMAIN}"
 }
 
 self_heal_once() {
     [[ -f "$CONFIG_FILE" ]] || return 0
-    local reason="" code xcode bad_count
+    local reason="" code xcode xms bad_count threshold
 
     if ! ensure_codespace_port_public >/dev/null 2>&1; then
         log_event WARN "self_heal port_public_failed port=${XRAY_PORT}"
@@ -576,33 +622,51 @@ self_heal_once() {
         fi
     fi
 
-    code=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "https://${PORT_DOMAIN}" 2>/dev/null || echo "0")
-    if [[ "$code" == "000" || "$code" == "0" ]]; then
-        log_event WARN "self_heal edge_unreachable code=${code:-0} action=force_reconnect"
-        force_reconnect --no-prompt >/dev/null 2>&1 \
-            || log_event ERROR "self_heal force_reconnect_failed code=${code:-0}"
+    read -r xcode xms < <(xhttp_probe_metrics external)
+    if xhttp_status_usable "$xcode"; then
+        reset_route_bad_count
+        reset_edge_bad_count
         return 0
     fi
 
-    xcode=$(xhttp_probe_status external)
-    if xhttp_status_usable "$xcode"; then
-        reset_route_bad_count
-    else
-        bad_count=$(increment_route_bad_count)
-        log_event WARN "self_heal route_unusable xhttp_probe=${xcode:-0} bad_count=${bad_count} action=observe"
-        if (( bad_count >= 2 )); then
-            log_event WARN "self_heal route_unusable action=repair port=${XRAY_PORT}"
-            repair_codespace_port_route >/dev/null 2>&1 || true
-            reset_route_bad_count
+    code=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "https://${PORT_DOMAIN}" 2>/dev/null || echo "0")
+    if [[ "$code" == "000" || "$code" == "0" ]]; then
+        threshold="$SELF_HEAL_EDGE_RECONNECT_THRESHOLD"
+        [[ "$threshold" =~ ^[0-9]+$ ]] || threshold=3
+        bad_count=$(increment_edge_bad_count)
+        if edge_reconnect_cooldown_active; then
+            log_event WARN "self_heal edge_unreachable code=${code:-0} bad_count=${bad_count} xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=cooldown"
+            return 0
         fi
+        if (( bad_count < threshold )); then
+            log_event WARN "self_heal edge_unreachable code=${code:-0} bad_count=${bad_count} action=observe xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
+            return 0
+        fi
+        log_event WARN "self_heal edge_unreachable code=${code:-0} bad_count=${bad_count} action=force_reconnect xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
+        mark_edge_reconnect_attempt
+        force_reconnect --no-prompt >/dev/null 2>&1 \
+            || log_event ERROR "self_heal force_reconnect_failed code=${code:-0}"
+        reset_edge_bad_count
+        return 0
+    fi
+
+    reset_edge_bad_count
+    bad_count=$(increment_route_bad_count)
+    log_event WARN "self_heal route_unusable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} bad_count=${bad_count} action=observe"
+    if (( bad_count >= 2 )); then
+        log_event WARN "self_heal route_unusable action=repair port=${XRAY_PORT}"
+        repair_codespace_port_route >/dev/null 2>&1 || true
+        reset_route_bad_count
     fi
 }
 
 _background_tasks() {
     set +e
     local tick=0 health_tick=0 export_tick=0
+    date +%s > "$BG_TASKS_HEARTBEAT_FILE" 2>/dev/null || true
     while true; do
         sleep 60
+        date +%s > "$BG_TASKS_HEARTBEAT_FILE" 2>/dev/null || true
         if [[ "$PORT_DOMAIN" == unknown-codespace* ]]; then
             local n; n=$(_detect_codespace_name 2>/dev/null || true)
             if [[ -n "$n" && "$n" != "unknown-codespace" ]]; then
@@ -719,6 +783,28 @@ bg_tasks_running() {
         return
     fi
     return 1
+}
+
+background_supervisor_status() {
+    local p running="false" token_state="missing" version_state="missing" heartbeat_age="unknown" hb now expected current
+    p=$(cat "$BG_TASKS_PID" 2>/dev/null || true)
+    if bg_tasks_running "$p"; then
+        running="true"
+    elif legacy_bg_tasks_running "$p"; then
+        running="legacy"
+    fi
+    [[ -s "$BG_TASKS_TOKEN_FILE" ]] && token_state="present"
+    expected=$(cat "$BG_TASKS_VERSION_FILE" 2>/dev/null || true)
+    current=$(background_supervisor_version)
+    if [[ -n "$expected" && -n "$current" ]]; then
+        [[ "$expected" == "$current" ]] && version_state="ok" || version_state="stale"
+    fi
+    hb=$(cat "$BG_TASKS_HEARTBEAT_FILE" 2>/dev/null || true)
+    if [[ "$hb" =~ ^[0-9]+$ ]]; then
+        now=$(date +%s)
+        heartbeat_age="$((now - hb))s"
+    fi
+    printf 'pid=%s running=%s version=%s token=%s heartbeat_age=%s\n' "${p:-none}" "$running" "$version_state" "$token_state" "$heartbeat_age"
 }
 
 format_bytes() {
@@ -879,9 +965,11 @@ generate_ip_link() {
 }
 
 generate_ip_links() {
-    local address index=1 printed=false
+    local address index=1 printed=false max_links="$MAX_FALLBACK_LINKS"
+    [[ "$max_links" =~ ^[0-9]+$ && "$max_links" -gt 0 ]] || max_links=3
     while IFS= read -r address; do
         [[ -n "$address" ]] || continue
+        (( index > max_links )) && break
         [[ "$printed" == true ]] && printf '\n'
         generate_link_for_address "$address" "-ip${index}"
         printed=true
@@ -983,6 +1071,9 @@ show_diagnostics() {
         fi
     fi
 
+    echo -e "\n  ${WHITE}${B}Background Supervisor${NC}"
+    echo -e "  ${DIM}$(background_supervisor_status)${NC}"
+
     echo -e "\n  ${WHITE}${B}Codespaces Ports${NC}"
     if command -v gh >/dev/null 2>&1; then
         GH_PROMPT_DISABLED=1 GH_NO_UPDATE_NOTIFIER=1 NO_COLOR=1 GH_FORCE_TTY=0 \
@@ -993,13 +1084,13 @@ show_diagnostics() {
     fi
 
     echo -e "\n  ${WHITE}${B}XHTTP Probes${NC}"
-    local local_probe edge_probe local_usable=false edge_usable=false
-    local_probe=$(xhttp_probe_status local)
-    edge_probe=$(xhttp_probe_status external)
+    local local_probe local_ms edge_probe edge_ms local_usable=false edge_usable=false
+    read -r local_probe local_ms < <(xhttp_probe_metrics local)
+    read -r edge_probe edge_ms < <(xhttp_probe_metrics external)
     xhttp_status_usable "$local_probe" && local_usable=true
     xhttp_status_usable "$edge_probe" && edge_usable=true
-    echo -e "  Local OPTIONS : ${WHITE}HTTP ${local_probe}${NC} ${DIM}(usable=${local_usable})${NC}"
-    echo -e "  Edge OPTIONS  : ${WHITE}HTTP ${edge_probe}${NC} ${DIM}(usable=${edge_usable})${NC}"
+    echo -e "  Local OPTIONS : ${WHITE}HTTP ${local_probe}${NC} ${DIM}(${local_ms:-0}ms usable=${local_usable})${NC}"
+    echo -e "  Edge OPTIONS  : ${WHITE}HTTP ${edge_probe}${NC} ${DIM}(${edge_ms:-0}ms usable=${edge_usable})${NC}"
     echo -e "  ${DIM}HTTP 404 here means the Codespaces edge has not routed this Host/path to Xray yet.${NC}"
 
     echo -e "\n  ${WHITE}${B}Fallback IP Candidates${NC}"
@@ -1009,6 +1100,20 @@ show_diagnostics() {
         printf '%s\n' "$ips" | sed 's/^/  /'
     else
         echo -e "  ${YELLOW}No IP candidates resolved from this environment.${NC}"
+    fi
+
+    echo -e "\n  ${WHITE}${B}Fallback Route Probes${NC}"
+    if [[ -n "$ips" ]]; then
+        local ip ip_probe ip_ms ip_usable
+        while IFS= read -r ip; do
+            [[ -n "$ip" ]] || continue
+            read -r ip_probe ip_ms < <(xhttp_probe_metrics external "$ip")
+            ip_usable=false
+            xhttp_status_usable "$ip_probe" && ip_usable=true
+            printf '  %-15s HTTP %-3s %4sms usable=%s\n' "$ip" "${ip_probe:-0}" "${ip_ms:-0}" "$ip_usable"
+        done <<< "$ips"
+    else
+        echo -e "  ${DIM}No fallback IPs to probe.${NC}"
     fi
 
     echo -e "\n  ${WHITE}${B}Recent G2ray Events${NC}"
@@ -1071,11 +1176,11 @@ force_reconnect() {
     fi
 
     echo -ne "  ${DIM}╰─${NC} Verify External   : "
-    local edge_reachable=false xhttp_route_usable=false code xcode
+    local edge_reachable=false xhttp_route_usable=false code xcode xms
     for _i in 1 2 3 4; do
         code=$(curl -s -m 5 -o /dev/null -w "%{http_code}" "https://${PORT_DOMAIN}" 2>/dev/null || echo "0")
         [[ "$code" != "000" && "$code" != "0" ]] && edge_reachable=true
-        xcode=$(xhttp_probe_status external)
+        read -r xcode xms < <(xhttp_probe_metrics external)
         if xhttp_status_usable "$xcode"; then
             xhttp_route_usable=true
             break
@@ -1085,10 +1190,10 @@ force_reconnect() {
     if [[ "$edge_reachable" == true && "$xhttp_route_usable" != true ]]; then
         repair_codespace_port_route >/dev/null 2>&1 || true
         sleep 3
-        xcode=$(xhttp_probe_status external)
+        read -r xcode xms < <(xhttp_probe_metrics external)
         xhttp_status_usable "$xcode" && xhttp_route_usable=true
     fi
-    log_event INFO "force_reconnect verify_external edge_reachable=${edge_reachable} code=${code:-none} xhttp_probe=${xcode:-none} xhttp_route_usable=${xhttp_route_usable} domain=${PORT_DOMAIN}"
+    log_event INFO "force_reconnect verify_external edge_reachable=${edge_reachable} code=${code:-none} xhttp_probe=${xcode:-none} xhttp_probe_ms=${xms:-0} xhttp_route_usable=${xhttp_route_usable} domain=${PORT_DOMAIN}"
     [[ "$edge_reachable" == true && "$xhttp_route_usable" == true ]] || failed=1
     if [[ "$xhttp_route_usable" == true ]]; then
         reset_route_bad_count
@@ -1104,13 +1209,56 @@ force_reconnect() {
     return 0
 }
 
+ensure_runtime_ready() {
+    local reason="${1:-startup}" xcode xms
+    [[ -f "$CONFIG_FILE" ]] || return 0
+
+    CODESPACE_NAME=$(_detect_codespace_name 2>/dev/null || true)
+    PORT_DOMAIN="${CODESPACE_NAME}-${XRAY_PORT}.app.github.dev"
+
+    if xray_listener_ready; then
+        read -r xcode xms < <(xhttp_probe_metrics external)
+        if xhttp_status_usable "$xcode"; then
+            ensure_codespace_port_public >/dev/null 2>&1 \
+                || log_event WARN "runtime_ready reason=${reason} port_public_failed port=${XRAY_PORT}"
+            reset_route_bad_count
+            reset_edge_bad_count
+            log_event INFO "runtime_ready reason=${reason} engine=running xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=skip_reconnect"
+            return 0
+        fi
+
+        log_event WARN "runtime_ready reason=${reason} route_unusable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=repair"
+        repair_codespace_port_route >/dev/null 2>&1 || true
+        read -r xcode xms < <(xhttp_probe_metrics external)
+        if xhttp_status_usable "$xcode"; then
+            reset_route_bad_count
+            log_event INFO "runtime_ready reason=${reason} route_repaired xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
+            return 0
+        fi
+        log_event WARN "runtime_ready reason=${reason} route_still_unusable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=observe"
+        return 1
+    fi
+
+    log_event WARN "runtime_ready reason=${reason} engine_not_ready action=start"
+    if start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1; then
+        ensure_codespace_port_public >/dev/null 2>&1 \
+            || log_event WARN "runtime_ready reason=${reason} port_public_failed port=${XRAY_PORT}"
+        read -r xcode xms < <(xhttp_probe_metrics external)
+        if ! xhttp_status_usable "$xcode"; then
+            log_event WARN "runtime_ready reason=${reason} started_route_unusable xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0} action=repair"
+            repair_codespace_port_route >/dev/null 2>&1 || true
+            read -r xcode xms < <(xhttp_probe_metrics external)
+        fi
+        log_event INFO "runtime_ready reason=${reason} engine=started xhttp_probe=${xcode:-0} xhttp_probe_ms=${xms:-0}"
+        return 0
+    fi
+
+    log_event ERROR "runtime_ready reason=${reason} start_failed port=${XRAY_PORT}"
+    return 1
+}
+
 if [[ "${1:-}" == "--silent-start" ]]; then
-    if ! stop_xray >/dev/null 2>&1; then
-        log_event WARN "silent_start stop_previous_failed"
-    fi
-    if [[ -f "$CONFIG_FILE" ]] && start_xray >/dev/null 2>&1 && wait_for_port >/dev/null 2>&1; then
-        ensure_codespace_port_public >/dev/null 2>&1 || true
-    fi
+    ensure_runtime_ready "silent_start" >/dev/null 2>&1 || true
     start_background_tasks
     exit 0
 fi
@@ -1148,7 +1296,7 @@ if [[ ! -f "$CONFIG_FILE" ]]; then
     fi
 else
     refresh_screen
-    force_reconnect --no-prompt || true
+    ensure_runtime_ready "interactive_attach" >/dev/null 2>&1 || true
 fi
 
 while true; do

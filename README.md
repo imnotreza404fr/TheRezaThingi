@@ -94,6 +94,10 @@ While G2ray is designed to be zero-config, advanced users can modify specific va
 - `CODESPACE_NAME` **(Optional)** — Overrides auto-detection of the app domain.
 - `G2RAY_QR_MODE` **(Optional)** — Controls QR display in the config view: `recommended` (default), `all`, or `none`.
 - `G2RAY_EXTRA_FALLBACK_IPS` **(Optional)** — Adds comma-, semicolon-, or space-separated IP fallback candidates before auto-detected ones.
+- `G2RAY_DEFAULT_FALLBACK_IPS` **(Optional)** — Replaces the built-in fallback IP candidate list.
+- `G2RAY_MAX_FALLBACK_LINKS` **(Optional)** — Caps exported IP fallback links. Default: `3`.
+- `G2RAY_EDGE_RECONNECT_THRESHOLD` **(Optional)** — Number of consecutive unreachable edge checks before self-heal may run a full reconnect. Default: `3`.
+- `G2RAY_RECONNECT_COOLDOWN_SEC` **(Optional)** — Minimum seconds between automatic full reconnects. Default: `300`.
 
 Generated links include `allowInsecure=1` for compatibility with IP fallback links that still route through the Codespaces SNI/Host. This is a compatibility tradeoff: clients that honor the flag may relax TLS certificate verification.
 

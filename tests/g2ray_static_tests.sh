@@ -9,6 +9,7 @@ GITATTRIBUTES="$ROOT_DIR/.gitattributes"
 README="$ROOT_DIR/README.md"
 CONFIGS="$ROOT_DIR/configs.txt"
 DOCKERFILE="$ROOT_DIR/.devcontainer/Dockerfile"
+CI_WORKFLOW="$ROOT_DIR/.github/workflows/static-tests.yml"
 
 fail() {
     printf 'FAIL: %s\n' "$1" >&2
@@ -362,11 +363,88 @@ test_runtime_control_paths_are_hardened() {
         || fail 'engine readiness does not verify the Xray/XHTTP listener, only an open port'
     grep_fixed 'while ! xray_listener_ready && (( i < 15 )); do' "$SCRIPT" \
         || fail 'wait_for_port still succeeds on any listener bound to the port'
-    grep_fixed 'log_event WARN "silent_start stop_previous_failed"' "$SCRIPT" \
-        || fail '--silent-start can still exit early when stop_xray fails under set -e'
+    grep_fixed 'ensure_runtime_ready "silent_start" >/dev/null 2>&1 || true' "$SCRIPT" \
+        || fail '--silent-start does not use the non-fatal health-gated startup path'
     grep_fixed 'if stop_xray; then' "$SCRIPT" \
         || fail 'interactive Stop Engine path does not handle stop_xray failure'
     pass 'runtime control paths are hardened'
+}
+
+test_startup_does_not_reconnect_healthy_runtime() {
+    grep_fixed 'ensure_runtime_ready()' "$SCRIPT" \
+        || fail 'script does not provide a health-gated startup path'
+    grep_fixed 'runtime_ready reason=${reason} engine=running' "$SCRIPT" \
+        || fail 'startup readiness path does not log when it reuses a healthy engine'
+    grep_fixed 'action=skip_reconnect' "$SCRIPT" \
+        || fail 'startup readiness path does not explicitly skip reconnects when healthy'
+    if awk '
+        /if \[\[ "\$\{1:-\}" == "--silent-start" \]\]; then/ { in_block=1 }
+        in_block && /^[[:space:]]*fi[[:space:]]*$/ { exit }
+        in_block && /stop_xray/ { bad=1; exit }
+        END { exit bad ? 0 : 1 }
+    ' "$SCRIPT"; then
+        fail '--silent-start still stops Xray unconditionally'
+    fi
+    grep_fixed 'ensure_runtime_ready "interactive_attach" >/dev/null 2>&1 || true' "$SCRIPT" \
+        || fail 'interactive attach does not use health-gated startup'
+    if grep_fixed 'force_reconnect --no-prompt || true' "$SCRIPT"; then
+        fail 'interactive attach still force-reconnects existing configs'
+    fi
+    pass 'startup paths do not reconnect a healthy runtime'
+}
+
+test_self_heal_uses_reconnect_backoff() {
+    grep_fixed 'EDGE_BAD_COUNT_FILE=' "$SCRIPT" \
+        || fail 'self-heal does not persist edge failure streaks'
+    grep_fixed 'EDGE_RECONNECT_STAMP_FILE=' "$SCRIPT" \
+        || fail 'self-heal does not persist reconnect cooldown timestamps'
+    grep_fixed 'SELF_HEAL_RECONNECT_COOLDOWN_SEC=' "$SCRIPT" \
+        || fail 'self-heal reconnect cooldown is not configurable'
+    grep_fixed 'edge_unreachable code=${code:-0} bad_count=${bad_count} action=observe' "$SCRIPT" \
+        || fail 'self-heal does not observe transient edge failures before reconnecting'
+    grep_fixed 'edge_unreachable code=${code:-0} bad_count=${bad_count} action=force_reconnect' "$SCRIPT" \
+        || fail 'self-heal does not log thresholded force reconnects'
+    if grep_fixed 'edge_unreachable code=${code:-0} action=force_reconnect' "$SCRIPT"; then
+        fail 'self-heal still force-reconnects on a single edge failure'
+    fi
+    pass 'self-heal reconnects are thresholded and cooled down'
+}
+
+test_diagnostics_show_latency_and_supervisor_state() {
+    grep_fixed 'xhttp_probe_metrics()' "$SCRIPT" \
+        || fail 'diagnostics cannot measure XHTTP probe latency'
+    grep_fixed 'xhttp_probe_ms=' "$SCRIPT" \
+        || fail 'health/reconnect logs do not include XHTTP probe latency'
+    grep_fixed 'BG_TASKS_HEARTBEAT_FILE=' "$SCRIPT" \
+        || fail 'background supervisor heartbeat file is missing'
+    grep_fixed 'background_supervisor_status()' "$SCRIPT" \
+        || fail 'diagnostics cannot summarize background supervisor state'
+    grep_fixed 'Background Supervisor' "$SCRIPT" \
+        || fail 'diagnostics do not show background supervisor state'
+    grep_fixed 'Fallback Route Probes' "$SCRIPT" \
+        || fail 'diagnostics do not probe fallback route latency'
+    grep_fixed 'ms' "$SCRIPT" \
+        || fail 'diagnostics do not display latency in milliseconds'
+    pass 'diagnostics show probe latency and supervisor state'
+}
+
+test_fallback_link_count_is_capped() {
+    grep_fixed 'MAX_FALLBACK_LINKS=' "$SCRIPT" \
+        || fail 'fallback link cap is not configurable'
+    grep_fixed '(( index > max_links )) && break' "$SCRIPT" \
+        || fail 'fallback link generation does not cap weak extra routes'
+    grep_fixed 'G2RAY_MAX_FALLBACK_LINKS' "$README" \
+        || fail 'README does not document the fallback link cap'
+    pass 'fallback link count is capped and documented'
+}
+
+test_ci_runs_static_regressions() {
+    [[ -f "$CI_WORKFLOW" ]] || fail 'static test GitHub Actions workflow is missing'
+    grep_fixed 'bash -n ./g2ray.sh' "$CI_WORKFLOW" \
+        || fail 'CI workflow does not syntax-check g2ray.sh'
+    grep_fixed 'bash ./tests/g2ray_static_tests.sh' "$CI_WORKFLOW" \
+        || fail 'CI workflow does not run the static regression suite'
+    pass 'CI runs shell syntax and static regression checks'
 }
 
 test_xhttp_route_settling_is_observable() {
@@ -496,6 +574,11 @@ test_terminal_branding_is_customized_red
 test_runtime_diagnostics_logging
 test_xhttp_route_settling_is_observable
 test_runtime_control_paths_are_hardened
+test_startup_does_not_reconnect_healthy_runtime
+test_self_heal_uses_reconnect_backoff
+test_diagnostics_show_latency_and_supervisor_state
+test_fallback_link_count_is_capped
+test_ci_runs_static_regressions
 test_docs_and_public_configs_are_consistent
 test_devcontainer_tooling_is_not_duplicated
 test_menu_loop_and_link_output_are_tidy
